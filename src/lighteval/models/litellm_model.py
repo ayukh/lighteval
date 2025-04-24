@@ -21,10 +21,8 @@
 # SOFTWARE.
 
 import logging
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from typing import Optional
 
 from tqdm import tqdm
@@ -37,6 +35,7 @@ from lighteval.models.model_output import (
     LoglikelihoodResponse,
     LoglikelihoodSingleTokenResponse,
 )
+from lighteval.models.utils import ModelConfig
 from lighteval.tasks.requests import (
     GreedyUntilRequest,
     LoglikelihoodRequest,
@@ -60,34 +59,38 @@ if is_litellm_available():
     litellm.cache = Cache(type="disk")
 
 
-@dataclass
-class LiteLLMModelConfig:
-    model: str
+class LiteLLMModelConfig(ModelConfig):
+    model_name: str
+    provider: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
 
 
 class LiteLLMClient(LightevalModel):
     _DEFAULT_MAX_LENGTH: int = 4096
 
-    def __init__(self, config, env_config) -> None:
+    def __init__(self, config) -> None:
         """
         IMPORTANT: Your API keys should be set in the environment variables.
         If a base_url is not set, it will default to the public API.
         """
         self.model_info = ModelInfo(
-            model_name=config.model,
+            model_name=config.model_name,
             model_sha="",
             model_dtype=None,
             model_size="",
         )
-        self.provider = config.model.split("/")[0]
-        self.base_url = os.getenv(f"{self.provider.upper()}_BASE_URL", None)
+        self.model = config.model_name
+        self.provider = config.provider or config.model_name.split("/")[0]
+        self.base_url = config.base_url
+        self.api_key = config.api_key
+        self.generation_parameters = config.generation_parameters
+
         self.API_MAX_RETRY = 5
         self.API_RETRY_SLEEP = 3
         self.API_RETRY_MULTIPLIER = 2
         self.CONCURENT_CALLS = 20  # 100 leads to hitting Anthropic rate limits
-        self.TEMPERATURE = 0.7
-        self.TOP_P = 0.95
-        self.model = config.model
+
         self._tokenizer = encode
         self.pairwise_tokenization = False
         litellm.drop_params = True
@@ -99,8 +102,6 @@ class LiteLLMClient(LightevalModel):
             # Filter out whitespace-only stop sequences
             if stop_sequence:
                 stop_sequence = [s for s in stop_sequence if s and s.strip()]
-        if not stop_sequence:  # If empty after filtering
-            stop_sequence = ["\n"]
         return stop_sequence
 
     def _prepare_max_new_tokens(self, max_new_tokens):
@@ -128,18 +129,19 @@ class LiteLLMClient(LightevalModel):
                 kwargs = {
                     "model": self.model,
                     "messages": prompt,
-                    "max_completion_tokens": max_new_tokens,
                     "logprobs": return_logits if self.provider == "openai" else None,
                     "base_url": self.base_url,
                     "n": num_samples,
                     "caching": True,
+                    "api_key": self.api_key,
                 }
                 if "o1" in self.model:
                     logger.warning("O1 models do not support temperature, top_p, stop sequence. Disabling.")
                 else:
-                    kwargs["temperature"] = self.TEMPERATURE
-                    kwargs["top_p"] = self.TOP_P
-                    kwargs["stop"] = stop_sequence
+                    kwargs.update(self.generation_parameters.to_litellm_dict())
+
+                if kwargs.get("max_completion_tokens", None) is None:
+                    kwargs["max_completion_tokens"] = max_new_tokens
 
                 response = litellm.completion(**kwargs)
 
